@@ -1,0 +1,59 @@
+-- ServerScriptService/Server/NetworkService.lua
+
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+
+local Network = {}
+Network.__index = Network
+
+local Remotes = ReplicatedStorage.Network.Remotes
+local ActionRemote = Remotes.Action
+local StateRemote = Remotes.State
+
+-- Rate limiting
+local RATE_LIMIT = 10 -- requests per second
+local playerBuckets = {}
+
+local function canProcess(player)
+	local bucket = playerBuckets[player]
+	if not bucket then
+		playerBuckets[player] = {count = 1, last = os.clock()}
+		return true
+	end
+
+	local now = os.clock()
+	if now - bucket.last >= 1 then
+		bucket.count = 1
+		bucket.last = now
+		return true
+	end
+
+	if bucket.count >= RATE_LIMIT then
+		return false
+	end
+
+	bucket.count += 1
+	return true
+end
+
+function Network.init()
+	ActionRemote.OnServerEvent:Connect(function(player, payload)
+		if typeof(payload) ~= "table" then return end
+		if not canProcess(player) then return end
+
+		if typeof(payload.action) ~= "string" then return end
+		if typeof(payload.data) ~= "table" then return end
+
+		Network.handleAction(player, payload)
+	end)
+
+	Players.PlayerRemoving:Connect(function(player)
+		playerBuckets[player] = nil
+	end)
+end
+
+function Network.broadcastState(player, state)
+	StateRemote:FireAllClients(player, state)
+end
+
+return Network
