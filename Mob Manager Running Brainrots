@@ -1,0 +1,575 @@
+--// VARIABLES
+
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local Workspace = game:GetService("Workspace")
+
+local MobFolder = ReplicatedStorage.Assets.Mobs
+local MobConfig = require(ReplicatedStorage.Shared.Configurations:WaitForChild("Mobs"))
+local WeightedChooser = require(script.Parent.WeightedPicker)
+local Rarities = MobConfig.Rarities
+local FormatNumber = require(ReplicatedStorage.Shared.FormatNumber.Simple)
+local DataService = require(script.Parent.PlayerDataService)
+local Mutations = require(ReplicatedStorage.Shared.Configurations.Mutations)
+
+local MarketPlaceService = game:GetService("MarketplaceService")
+local Monetization = require(ReplicatedStorage.Shared.Misc.Monetization)
+
+local HttpService = game:GetService("HttpService")
+local Players = game:GetService("Players")
+
+local Debris = game:GetService("Debris")
+
+local RunService = game:GetService("RunService")
+local TweenService = game:GetService("TweenService")
+
+--// FUNCTIONALITY
+
+local function SetCollisionGroup(character: Model)
+	for _, part in ipairs(character:GetDescendants()) do
+		if part:IsA("BasePart") or part:IsA("MeshPart") then
+			part.CollisionGroup = "Character"
+			part.CanCollide = false
+		end
+	end
+end
+
+local ActiveDebounces = {}
+local ActiveModels = {}
+
+local Debug = {}
+Debug.__index = Debug
+
+function Debug.new(prefix)
+	local self = setmetatable({}, Debug)
+	
+	self.Prefix = prefix or "DEBUG"
+	return self
+end
+
+function Debug:Print(...)
+	print(string.format("[%s]", self.Prefix), ...)
+end
+
+function Debug:Warn(...)
+	warn(string.format("[%s]", self.Prefix), ...)
+end
+
+local MobManager = {}
+MobManager.__index = MobManager
+
+function MobManager.new(spawnFolder)
+	local self = setmetatable({}, MobManager)
+
+	self.SpawnFolder = spawnFolder or Workspace.Main.MobSpawns
+	self.ActiveMobs = {}
+	self.SpawnInterval = 2.5
+	self.MobSpeed = 9
+	self.GameActive = false
+	
+	self.LegendaryTimeLeft = 300
+	self.MythicTimeLeft = 600
+	self.SecretTimeLeft = 900
+	
+	self.Debug = Debug.new("MobManager")
+
+	return self
+end
+
+function MobManager:PickSpawn()
+	local spawnPoints = self.SpawnFolder:GetChildren()
+	
+	if #spawnPoints == 0 then
+		self.Debug:Warn("No available spawn points found in SpawnFolder.")
+		return nil
+	end
+
+	local selectedSpawn = spawnPoints[math.random(1, #spawnPoints)]
+	self.Debug:Print("Selected spawn point:", selectedSpawn.Name)
+	
+	return selectedSpawn
+end
+
+function MobManager:ApplyVFX(mob: Model, effect: string)
+	local FX = ReplicatedStorage.Assets.Effects:FindFirstChild(effect) or nil
+
+	if not FX then
+		self.Debug:Warn("No VFX found in storage")
+
+		return
+	end
+
+	local VFX = FX:Clone()
+	VFX.Parent = mob.PrimaryPart or mob:FindFirstChildOfClass("BasePart") or mob:FindFirstChildOfClass("MeshPart")
+
+	for _, Effects in VFX:GetChildren() do
+		if Effects:IsA("ParticleEmitter") then
+			local amount = Effects:GetAttribute("EmitCount") or 10
+			Effects:Emit(amount)
+		end
+	end
+	
+	Debris:AddItem(VFX, 1.5)
+end
+
+function MobManager:TrackMob(mob)
+	local PrimaryPart = mob.PrimaryPart or mob:FindFirstChild("HumanoidRootPart") or mob:FindFirstChildWhichIsA("BasePart")
+	
+	if not PrimaryPart then
+		self.Debug:Warn("Mob has no PrimaryPart or HumanoidRootPart.")
+		
+		return
+	end
+
+	local function cleanup()
+		self.ActiveMobs[mob] = nil
+		ActiveModels[mob] = nil
+		mob:SetAttribute("Claimable", 0)
+		if mob.Parent then mob:Destroy() end
+	end
+
+	mob:GetPropertyChangedSignal("Parent"):Connect(cleanup)
+	mob.AncestryChanged:Connect(cleanup)
+end
+
+function MobManager:SetupAsTool(player: Player, mobName: string, new: boolean, mutation)
+	local data = DataService:Get(player)
+	
+	if not data then 
+		self.Debug:Warn("No player data found for:", player)
+		return 
+	end
+	
+	local plot = game.Workspace.Main.Plots:FindFirstChild(player.Character:GetAttribute("Plot"))
+
+	local mobModel = ReplicatedStorage:FindFirstChild("Assets")
+		and ReplicatedStorage.Assets:FindFirstChild("Mobs")
+		and ReplicatedStorage.Assets.Mobs:FindFirstChild(mobName)
+
+	if not mobModel then
+		self.Debug:Warn(("Mob model '%s' does not exist."):format(mobName))
+		return 
+	end
+
+	local clone = mobModel:Clone()
+	local primaryPart = clone.PrimaryPart or clone:FindFirstChild("HumanoidRootPart") or clone:FindFirstChildWhichIsA("BasePart")
+
+	if not primaryPart then
+		self.Debug:Warn(("Mob '%s' has no PrimaryPart or HumanoidRootPart."):format(mobName))
+		return
+	end
+
+	local uuid
+
+	if new then
+		uuid = HttpService:GenerateGUID(false)
+		
+		print(mutation)
+		
+		local info = {
+			UUID = uuid,
+			Name = mobName,
+			mutate = mutation,
+			TypeIs = "Inventory"
+		}
+	
+		table.insert(data.Profile.Data.OwnedMobs, info)
+		data:Set({"OwnedMobs"}, data.Profile.Data.OwnedMobs)
+	else
+		for _, datas in data.Profile.Data.OwnedMobs do
+			uuid = datas.UUID
+		end
+	end
+
+	local tool = Instance.new("Tool")
+
+	if mutation then
+		local mutationInfo = Mutations.Mutations[mutation]
+
+		self:ApplyMutation(mutation, clone)
+
+		tool:SetAttribute("Mutation", mutation)
+		tool:SetAttribute("Multiplier", mutationInfo.Multiplier)
+		tool:SetAttribute("Color", mutationInfo.Color)
+		
+		tool.Name = mobName.." ("..mutation..")"
+	else
+		tool.Name = mobName
+	end
+
+	tool.RequiresHandle = true
+	tool.CanBeDropped = false
+	tool:SetAttribute("uuid", uuid)
+
+	clone.Parent = tool
+	tool.ToolTip = MobConfig and MobConfig.DisplayName or mobName
+
+	local handle = Instance.new("Part")
+	handle.Position = mobModel.PrimaryPart.Position - Vector3.new(0, 2, 0)
+	handle.Name = "Handle"
+	handle.Anchored = false
+	handle.Size = Vector3.new(1, 1, 1)
+	handle.Transparency = 1
+	handle.CanCollide = false
+	handle.Parent = tool
+	
+	local humanoid = clone:FindFirstChildOfClass("Humanoid")
+
+	if humanoid then
+		if clone:FindFirstChild("SimpleAnimate") then
+			clone:FindFirstChild("SimpleAnimate").Enabled = false
+		end
+		
+		humanoid:Destroy()
+	end
+	
+	tool.PrimaryPart = handle
+	tool:ScaleTo(0.45)
+
+	for _, desc in clone:GetDescendants() do
+		if desc:IsA("BasePart") or desc:IsA("MeshPart") then
+			desc.CanCollide = false
+			desc.Anchored = false
+
+			if desc ~= handle then
+				local weld = Instance.new("WeldConstraint")
+				weld.Part0 = handle
+				weld.Part1 = desc
+				weld.Parent = handle
+			end
+		end
+	end
+	
+	if data.Profile.Data.Tutorial <= 4 and new then
+		player.Character.Humanoid:UnequipTools()
+		tool.Parent = player.Character or player:FindFirstChildOfClass("Backpack")
+	else
+		tool.Parent = player.Backpack
+	end
+
+	local function IsPlayerWithinPlot(plot: BasePart, player: Player)
+		local character = player.Character
+		if not character then return false end
+
+		local root = character:FindFirstChild("HumanoidRootPart")
+		if not root then return false end
+
+		local validPart = plot:FindFirstChild("ValidPlace")
+		if not validPart then return false end
+
+		local relativePos = validPart.CFrame:PointToObjectSpace(root.Position)
+		local halfSize = validPart.Size * 0.5
+
+		return relativePos.X >= -halfSize.X
+			and relativePos.X <= halfSize.X
+			and relativePos.Z >= -halfSize.Z
+			and relativePos.Z <= halfSize.Z
+	end
+	
+	task.spawn(function()
+		task.wait(0.5)
+		
+		tool.Activated:Connect(function()
+			local plot = game.Workspace.Main.Plots:FindFirstChild(player.Character:GetAttribute("Plot"))
+			if not plot then
+				
+				self.Debug:Warn("No plot found for", player)
+				return
+			end
+
+			local Valid = IsPlayerWithinPlot(plot, player)
+
+			if Valid then
+				self:SetupInPlot(player, tool, nil, mutation)
+			else
+				print("NOT VALID")
+			end
+		end)
+	end)
+end
+
+function MobManager:GetRandomCF(plot: BasePart)
+	local size = plot.Size
+	local center = plot.Position
+
+	local x = math.random(center.X - size.X / 2, center.X + size.X / 2)
+	local z = math.random(center.Z - size.Z / 2, center.Z + size.Z / 2)
+	local y = center.Y + size.Y / 2
+
+	return CFrame.new(x, y, z) + Vector3.new(0, 5, 0)
+end
+
+function MobManager:CalculateOfflineEarns(player: Player, model: Model)
+	task.spawn(function()
+		local data = DataService:Get(player)
+		if not data then return end
+
+		local UUID = model:GetAttribute("uuid")
+		if not UUID then return end
+
+		local info = MobConfig.Mobs[model.Name]
+		if not info then return end
+
+		local exitTime = data.Profile.Data.ExitTimestamp or 0
+		local currentTime = os.time()
+		local timeDifference = math.clamp(currentTime - exitTime, 0, 86400 * 7)
+
+		for _, datas in pairs(data.Profile.Data.OwnedMobs) do
+			if datas.Name == model.Name and datas.UUID == UUID then
+				local newEarns = math.floor(((timeDifference * info.Income) / 10) + 0.5)
+				local current = model:GetAttribute("Claimable") or 0
+
+				model:SetAttribute("OfflineCash", newEarns)
+
+				print(("Offline earn for %s: +%d"):format(model.Name, newEarns))
+
+				break
+			end
+		end
+	end)
+end
+
+
+function MobManager:StartIncome(model: Model)
+	local UITemplate = ReplicatedStorage.Assets.UIObjects.IncomeUI
+	local info = MobConfig.Mobs[model.Name]
+	if not info then return end
+
+	local Clone = UITemplate:Clone()
+	local mutation = model:GetAttribute("Mutation")
+	local multiplier = model:GetAttribute("Multiplier") or 1
+	local color = model:GetAttribute("Color") or Color3.new(1, 1, 1)
+
+	if mutation then
+		Clone.Title.Text = string.format("%s (%s)", model.Name, mutation)
+		Clone.Title.TextColor3 = color
+	else
+		Clone.Title.Text = model.Name
+	end
+
+	local baseIncome = info.Income or 1
+	local displayIncome = baseIncome * multiplier
+	
+	Clone.Holder.Amount.Text = string.format("$%s/s - Claim: $%s", FormatNumber.FormatCompact(displayIncome), FormatNumber.FormatCompact(model:GetAttribute("Claimable") or 0))
+	Clone.Offline.Text = "Offline Earns: $0"
+
+	model:GetAttributeChangedSignal("Claimable"):Connect(function()
+		local claimable = model:GetAttribute("Claimable") or 0
+		Clone.Holder.Amount.Text = string.format("$%s/s - Claim: $%s", FormatNumber.FormatCompact(displayIncome), FormatNumber.FormatCompact(claimable))
+	end)
+
+	model:GetAttributeChangedSignal("OfflineCash"):Connect(function()
+		local offlineCash = model:GetAttribute("OfflineCash") or 0
+		Clone.Offline.Visible = offlineCash > 0
+		Clone.Offline.Text = "Offline Earns: $" .. FormatNumber.FormatCompact(offlineCash)
+	end)
+
+	if model:GetAttribute("OfflineCash") and model:GetAttribute("OfflineCash") > 0 then
+		Clone.Offline.Visible = true
+	end
+
+	Clone.Parent = model:FindFirstChild("Billboard") or Instance.new("Attachment", model)
+
+	for _, part in model:GetChildren() do
+		if part:IsA("BasePart") then
+			part.Touched:Connect(function(hit)
+				if not hit.Parent then return end
+				local plr = Players:FindFirstChild(hit.Parent.Name)
+				if not plr then return end
+				
+				local plot = workspace.Main.Plots:FindFirstChild(plr.Character:GetAttribute("Plot"))
+				if not plot.Mobs:FindFirstChild(model.Name) then return end
+				local uuid = model:GetAttribute("uuid")
+				
+				if plot.Mobs:FindFirstChild(model.Name):GetAttribute("uuid") ~= uuid then return end
+				
+				if ActiveDebounces[plr] then return end
+				ActiveDebounces[plr] = true
+
+				task.spawn(function()
+					local data = DataService:Get(plr)
+					if not data then
+						ActiveDebounces[plr] = false
+						return
+					end
+
+					local claimable = model:GetAttribute("Claimable") or 0
+					local offline = model:GetAttribute("OfflineCash") or 0
+					local total = (claimable + offline) * multiplier
+					
+					if MarketPlaceService:UserOwnsGamePassAsync(plr.UserId, Monetization.Gamepasses["X2 Cash"]) then
+						total *= 2
+					end
+					
+					data.Profile.Data.Cash += total
+					data:Set({"Cash"}, data.Profile.Data.Cash)
+
+					self:ApplyVFX(plr.Character, "Money")
+
+					ReplicatedStorage.Remotes.PlaySound:FireClient(plr, "Collect")
+
+					task.spawn(function()
+						if data.Profile.Data.Tutorial == 3 then
+							data.Profile.Data.Tutorial = 4
+							ReplicatedStorage.Remotes.PlayFireworks:FireClient(plr)
+							data:Set({"Tutorial"}, data.Profile.Data.Tutorial)
+							task.wait(5)
+							data.Profile.Data.Tutorial = 5
+							data:Set({"Tutorial"}, data.Profile.Data.Tutorial)
+						end
+					end)
+
+					model:SetAttribute("Claimable", 0)
+					model:SetAttribute("OfflineCash", 0)
+					Clone.Offline.Visible = false
+
+					task.wait(0.5)
+					ActiveDebounces[plr] = false
+				end)
+			end)
+		end
+	end
+end
+
+function MobManager:StartMoveTo(part: BasePart, model: Model)
+	local humanoid = model:FindFirstChildOfClass("Humanoid")
+	
+	if not humanoid then return end
+
+	local function Redirect()
+		if not humanoid.Parent then return end
+
+		local targetCF = self:GetRandomCF(part)
+		humanoid:MoveTo(targetCF.Position)
+	end
+	
+	humanoid.WalkSpeed = 8
+
+	humanoid.MoveToFinished:Connect(function(reached)
+		if reached then
+			task.wait(3)
+			Redirect()
+		else
+			task.wait(3)
+			Redirect()
+		end
+	end)
+
+	Redirect()
+end
+
+function MobManager:GenerateProximityPrompt(model: Model)
+	local uuid = model:GetAttribute("uuid")
+	local owner = model:GetAttribute("Owner")
+	
+	local prompt = Instance.new("ProximityPrompt")
+	
+	prompt.ActionText = "Pick Up"
+	prompt.ObjectText = model.Name
+	prompt.Parent = model.HumanoidRootPart or model.PrimaryPart or model:FindFirstChildOfClass("BasePart")
+	
+	prompt.MaxActivationDistance = 7
+	
+	prompt.Enabled = true
+	prompt.RequiresLineOfSight = false
+	
+	prompt.Triggered:Connect(function(player)
+		local data = DataService:Get(player)
+		if not data then return end
+		
+		local toSetup
+		
+		for _, datas in data.Profile.Data.OwnedMobs do
+			if datas.UUID == uuid then
+				datas.TypeIs = "Inventory"
+				toSetup = datas
+				
+				data:Set({"OwnedMobs"}, data.Profile.Data.OwnedMobs)
+				
+				break
+			end
+		end
+
+		if toSetup then
+			self:SetupAsTool(player, model.Name, false, model:GetAttribute("Mutation"))
+			model:Destroy()
+		end
+	end)
+end
+
+function MobManager:SetupInPlot(player, mob: Tool, name: string, mutation)
+	local data = DataService:Get(player)
+	if not data then return end
+
+	local Plot = Workspace.Main.Plots:FindFirstChild(player.Character:GetAttribute("Plot"))
+	if not Plot then return end
+
+	local MobFolder = Plot:FindFirstChild("Mobs")
+	if not MobFolder then return end
+	
+	if #MobFolder:GetChildren() > 7 then
+		ReplicatedStorage.Remotes.Notify:FireClient(player, "MAX Mobs in plot...", 3, "Error")
+		
+		return
+	end
+	
+	if mob then
+		local uuid = mob:GetAttribute("uuid")
+		
+		local mobConfig = MobConfig.Mobs[mob.Name]
+		
+		local baseName = mob.Name:match("^(.-)%s*%b()$") or mob.Name:match("^(.-)%s*%(") or mob.Name
+		local mobModel = ReplicatedStorage.Assets.Mobs:FindFirstChild(baseName)
+
+		if not MobConfig or not mobModel then
+
+			self.Debug:Warn(("Invalid MobConfig or model missing for '%s'"):format(mob.Name))
+
+			return
+		end
+
+		for _, datas in data.Profile.Data.OwnedMobs do
+			if datas.UUID == uuid then
+				datas.TypeIs = "Plot"
+				data:Set({"OwnedMobs"}, data.Profile.Data.OwnedMobs)
+				
+				break
+			end
+		end
+
+		local Clone = mobModel:Clone()
+		
+		if mutation then
+			local mutationInfo = Mutations.Mutations[mutation]
+
+			self:ApplyMutation(mutation, Clone)
+
+			Clone:SetAttribute("Mutation", mutation)
+			Clone:SetAttribute("Multiplier", mutationInfo.Multiplier)
+			Clone:SetAttribute("Color", mutationInfo.Color)
+		end
+		
+		local primaryPart = Clone.PrimaryPart or Clone:FindFirstChild("HumanoidRootPart") or Clone:FindFirstChildWhichIsA("BasePart")
+
+		if not primaryPart then
+			self.Debug:Warn(("Mob '%s' has no PrimaryPart or HumanoidRootPart."):format(mob.Name))
+
+			return
+		end
+
+		local random = self:GetRandomCF(Plot.ValidPlace)
+		
+		local Scale = Clone:GetScale() or 1
+		Clone:ScaleTo(Scale / 1.5)
+		
+		Clone:PivotTo(random)
+		
+		Clone.Parent = MobFolder
+
+		self.Debug:Print(("Placed mob '%s' into %s's plot"):format(mob.Name, player.Name))
+		
+		mob:Destroy()
+		Clone:SetAttribute("uuid", uuid)
+		Clone:SetAttribute("Owner", player.UserId)
+		self:GenerateProximityPrompt(Clone)
+		SetCollisionGroup(Clone)
+		self:StartMoveTo(Plot.ValidPlace, Clone)
